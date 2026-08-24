@@ -1,5 +1,7 @@
 # LSM Storage Engine
 
+[![CI](https://github.com/Sahithigummadi05/LSM-tree-key-value-store/actions/workflows/ci.yml/badge.svg)](https://github.com/Sahithigummadi05/LSM-tree-key-value-store/actions/workflows/ci.yml)
+
 A log-structured merge-tree key-value store in Java 21 — write-ahead logging, immutable SSTables,
 compaction (full and size-tiered), bloom filters, and range scans. This is the design underneath
 RocksDB, LevelDB, Cassandra, and HBase, built from scratch to understand the trade-offs rather than
