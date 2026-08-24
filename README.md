@@ -1,8 +1,9 @@
 # LSM Storage Engine
 
 A log-structured merge-tree key-value store in Java 21 — write-ahead logging, immutable SSTables,
-background compaction, and bloom filters. This is the design underneath RocksDB, LevelDB,
-Cassandra, and HBase, built from scratch to understand the trade-offs rather than inherit them.
+compaction (full and size-tiered), bloom filters, and range scans. This is the design underneath
+RocksDB, LevelDB, Cassandra, and HBase, built from scratch to understand the trade-offs rather than
+inherit them.
 
 ```java
 try (var store = new LsmStore(Path.of("/var/data"))) {
@@ -84,6 +85,72 @@ from inside a process. Verifying that needs real hardware losing power or a faul
 filesystem. This is stated plainly here rather than left for a reader to assume the test covers
 more than it can.
 
+## Range scans
+
+```java
+var keys = store.scanKeys("user:100", "user:200");   // sorted, deletions excluded
+```
+
+This is the capability that justifies keeping everything sorted, and a major reason to pick an LSM
+tree over a hash-indexed store: because the memtable and every SSTable are already in key order, a
+range query is a **k-way merge of sorted streams** — nothing is sorted at query time, and no data
+outside the range is read. A hash index cannot answer the same question without scanning
+everything.
+
+`MergingScanner` runs a heap-based merge in O(n log k) for n records across k sources. It is not a
+plain sorted union, because the same key legitimately appears in several sources with different
+values — so each source carries a **recency rank**, and when several offer the same key the newest
+wins and the rest are discarded.
+
+That detail is easy to get wrong in a way that hides: point lookups walk sources newest-first and
+return the first hit, so recency is handled by the loop itself and `get()` stays correct. Only
+scans have to resolve it explicitly. A bug there produces stale values in range results while every
+`get()` test still passes — so scans are verified against a `TreeMap` reference model across five
+seeded randomized workloads, checking full scans, twenty random bounded windows each, and the
+values, not just the key set.
+
+Tombstones are consumed by the merge rather than returned: a deleted key must not appear, and its
+tombstone still has to shadow older versions from older sources — so it wins the merge, suppresses
+them, and is then dropped.
+
+## Compaction strategy, and what it costs
+
+Full compaction is simple but rewrites the entire dataset every run, so its cost scales with total
+data no matter how little changed. **Size-tiered** compaction merges only tables of comparable size
+(within 4×): freshly-flushed small tables merge cheaply and often, while a large table is rewritten
+only once enough other large tables exist to join it — the approach Cassandra and RocksDB's tiered
+mode use.
+
+Measured on a **growing** dataset (mostly new keys, 20% overwrites), bytes physically written:
+
+| Rounds | Full compaction | Size-tiered | Saved |
+|---:|---:|---:|---:|
+| 10 | 563,708 | 374,166 | 33.6% |
+| 20 | 1,958,290 | 877,382 | 55.2% |
+| 40 | 7,291,280 | 2,258,302 | 69.0% |
+| 80 | 28,113,100 | 5,984,604 | **78.7%** |
+
+The percentages matter less than the shape: full compaction grows ~4× per doubling of work
+(quadratic — it rewrites everything, and "everything" keeps getting bigger), while size-tiered grows
+~2.6× (near-linear). The advantage widens with scale, which is the entire reason the strategy
+exists.
+
+**Two findings worth being explicit about, because the tests produced them rather than confirming
+what I expected:**
+
+*A bug the correctness tests could not see.* The first size-tiering implementation checked only
+that a candidate table was not too large for its bucket. That let a small, freshly-flushed table
+join a bucket anchored by a huge one — quietly turning every compaction back into a full rewrite.
+Every correctness test still passed, because the results were right; the byte counter showed the
+two strategies writing **identical** totals, which is what exposed it. The similarity test now has
+to hold in both directions.
+
+*A claim that was wrong until the workload was.* An earlier version measured a flat ~17% saving
+that slightly *shrank* with scale, and the test correctly failed the "advantage grows" assertion.
+The cause was the benchmark, not the algorithm: it reused a fixed 500-key space, so the dataset
+never grew and both strategies cost the same per round. Size-tiering's advantage is specifically
+about datasets that grow — so the workload was fixed to grow, and the claim then held.
+
 ## Measured behaviour
 
 `mvn test -Dtest=BenchmarkTest`. Ranges are across repeated runs on one containerized dev box.
@@ -136,7 +203,8 @@ machine.
 | `memtable/Memtable` | Sorted in-memory buffer (`ConcurrentSkipListMap`, unsigned key order) |
 | `sstable/SSTable` | Immutable sorted file: data, sparse index, bloom filter, footer with magic |
 | `bloom/BloomFilter` | Double-hashed bit array sized from expected entries and target FP rate |
-| `LsmStore` | Read path, flush, compaction, crash recovery |
+| `LsmStore` | Read path, flush, compaction (full and size-tiered), crash recovery |
+| `MergingScanner` | Heap-based k-way merge for range scans, newest-version-wins |
 
 **A few decisions worth calling out:**
 
@@ -157,7 +225,7 @@ machine.
 ## Testing
 
 ```bash
-mvn test     # 34 tests
+mvn test     # 52 tests
 ```
 
 Beyond the crash and bloom suites, `LsmStoreTest` includes **differential testing against a
@@ -178,15 +246,14 @@ Explicitly covered because they are the classic LSM failure modes:
 
 Stated rather than left to be discovered:
 
-- **Full compaction, not levelled or size-tiered.** Every compaction merges all tables. The
-  mechanism that matters — resolving duplicates by recency, reclaiming shadowed data — is the same,
-  but real engines use levelling to bound write amplification as data grows.
+- **Two compaction strategies, neither levelled.** Full and size-tiered are both implemented;
+  RocksDB's levelled mode bounds write amplification further at the cost of more read work.
 - **Compaction is synchronous.** It runs on the calling thread and blocks writes. Production
   engines compact in the background.
 - **SSTable data is held in memory once opened.** Fine at these sizes, wrong for datasets larger
   than RAM, which would need `mmap` or paged block reads.
 - **Single writer.** `put`/`get` are synchronized on the store; there is no MVCC or snapshot
   isolation.
-- **No range scans or iterators.** The sorted layout supports them naturally, but they aren't
-  implemented.
+- **Scans materialise each source.** `scan()` reads whole SSTables into lists before merging,
+  which is fine at these sizes but should stream blocks for datasets larger than memory.
 - **fsync durability is unverified** — see the crash-testing section above.
