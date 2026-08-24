@@ -44,6 +44,7 @@ public final class LsmStore implements AutoCloseable {
     private static final String WAL_FILE = "wal.log";
     private static final String SSTABLE_PREFIX = "sstable-";
     private static final String SSTABLE_SUFFIX = ".db";
+    private static final String MANIFEST_FILE = "MANIFEST";
 
     private final Path directory;
     private final long memtableFlushBytes;
@@ -88,35 +89,56 @@ public final class LsmStore implements AutoCloseable {
     /**
      * Rebuilds state after a restart, clean or otherwise.
      *
-     * <p>Existing SSTables are loaded oldest-first. Any that fail to open lacked a valid footer,
-     * meaning they were being written when the process died — they are deleted rather than
-     * tolerated, and the records they would have held are still in the log. Replaying the log then
-     * restores exactly the memtable that was lost.
+     * <p>Table order is read from the {@value #MANIFEST_FILE}, not inferred from filenames. That
+     * distinction is load-bearing. Compaction assigns the merged table a fresh (highest) id while
+     * splicing it into the position of the <em>oldest</em> table it replaced — so whenever a merge
+     * covers anything other than the newest tables, sorting by id on recovery reverses the real age
+     * order. Because reads take the first hit walking newest-to-oldest, that inversion silently
+     * resurrects stale values: the store answers correctly right up until it is restarted. A
+     * manifest records the true order explicitly, which is why LevelDB and RocksDB keep one.
+     *
+     * <p>Any {@code .db} file not listed in the manifest is debris from a crash between writing a
+     * table and committing the manifest, and is deleted. Its records are still in the write-ahead
+     * log, so nothing is lost. Replaying the log then restores exactly the memtable that was lost.
      */
     private void recover() throws IOException {
-        try (Stream<Path> files = Files.list(directory)) {
-            var tables = files
-                    .filter(p -> p.getFileName().toString().startsWith(SSTABLE_PREFIX))
-                    .filter(p -> p.getFileName().toString().endsWith(SSTABLE_SUFFIX))
-                    .sorted(Comparator.comparingLong(LsmStore::tableIdOf))
-                    .toList();
-
-            for (var path : tables) {
-                try {
-                    ssTables.add(SSTable.open(path));
-                    nextTableId.set(Math.max(nextTableId.get(), tableIdOf(path) + 1));
-                } catch (IOException e) {
-                    // Unfinished flush from a crash. Safe to discard: the write-ahead log still
-                    // holds every record this file was going to contain.
-                    Files.deleteIfExists(path);
-                }
+        var ordered = readManifest();
+        if (ordered == null) {
+            // No manifest: either a brand-new store or one written before manifests existed.
+            // Filename order is the best available guess, and is correct unless a compaction
+            // reordered tables - which is exactly the case the manifest was added to fix.
+            try (Stream<Path> files = Files.list(directory)) {
+                ordered = files
+                        .filter(p -> p.getFileName().toString().startsWith(SSTABLE_PREFIX))
+                        .filter(p -> p.getFileName().toString().endsWith(SSTABLE_SUFFIX))
+                        .sorted(Comparator.comparingLong(LsmStore::tableIdOf))
+                        .toList();
             }
         }
 
-        // Clean up any temp files left behind by a crash during flush.
-        try (Stream<Path> files = Files.list(directory)) {
-            for (var path : files.filter(p -> p.getFileName().toString().endsWith(".tmp")).toList()) {
+        var live = new java.util.HashSet<String>();
+        for (var path : ordered) {
+            try {
+                ssTables.add(SSTable.open(path));
+                live.add(path.getFileName().toString());
+                nextTableId.set(Math.max(nextTableId.get(), tableIdOf(path) + 1));
+            } catch (IOException e) {
+                // Unfinished flush from a crash. Safe to discard: the write-ahead log still
+                // holds every record this file was going to contain.
                 Files.deleteIfExists(path);
+            }
+        }
+
+        // Remove SSTables the manifest does not list, plus temp files from an interrupted write.
+        try (Stream<Path> files = Files.list(directory)) {
+            for (var path : files.toList()) {
+                var name = path.getFileName().toString();
+                var isOrphanTable = name.startsWith(SSTABLE_PREFIX)
+                        && name.endsWith(SSTABLE_SUFFIX)
+                        && !live.contains(name);
+                if (isOrphanTable || name.endsWith(".tmp")) {
+                    Files.deleteIfExists(path);
+                }
             }
         }
 
@@ -125,6 +147,43 @@ public final class LsmStore implements AutoCloseable {
             memtable.put(record);
         }
         wal = new WriteAheadLog(walPath, fsyncOnWrite);
+    }
+
+    /** @return the recorded table order (oldest first), or null when no manifest exists yet. */
+    private List<Path> readManifest() throws IOException {
+        var manifest = directory.resolve(MANIFEST_FILE);
+        if (!Files.exists(manifest)) {
+            return null;
+        }
+        var paths = new ArrayList<Path>();
+        for (var line : Files.readAllLines(manifest)) {
+            var name = line.strip();
+            if (!name.isEmpty() && Files.exists(directory.resolve(name))) {
+                paths.add(directory.resolve(name));
+            }
+        }
+        return paths;
+    }
+
+    /**
+     * Records the current table order, oldest first.
+     *
+     * <p>Written to a temp file and atomically renamed, so the manifest is never observed
+     * half-written. Ordering relative to the data it describes is what makes crashes safe: a new
+     * SSTable is fully durable before the manifest names it, and old tables are only deleted after
+     * the manifest stops naming them. A crash on either side leaves a manifest that points at a
+     * complete, consistent set of files.
+     */
+    private void writeManifest() throws IOException {
+        var temp = directory.resolve(MANIFEST_FILE + ".tmp");
+        var names = ssTables.stream().map(t -> t.path().getFileName().toString()).toList();
+        Files.write(temp, names);
+        try (var channel = java.nio.channels.FileChannel.open(temp, java.nio.file.StandardOpenOption.WRITE)) {
+            channel.force(true);
+        }
+        Files.move(temp, directory.resolve(MANIFEST_FILE),
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     }
 
     private static long tableIdOf(Path path) {
@@ -238,6 +297,10 @@ public final class LsmStore implements AutoCloseable {
         SSTable.write(path, memtable.records());
         bytesWrittenToSSTables += Files.size(path);
         ssTables.add(SSTable.open(path));
+        // Commit the new table to the manifest before the log is discarded: until the manifest
+        // names it, a crash would treat the file as debris and the records would have to come back
+        // from the log.
+        writeManifest();
 
         // Only safe to discard the log once the SSTable is durably on disk - which SSTable.write
         // guarantees by fsyncing before its atomic rename.
@@ -379,8 +442,13 @@ public final class LsmStore implements AutoCloseable {
         ssTables.removeAll(toMerge);
         ssTables.add(insertAt, SSTable.open(path));
 
-        // Delete only after the replacement is durable and installed, so a crash mid-compaction
-        // leaves the old tables intact and recoverable.
+        // Commit the new order before deleting anything. The merged table sits where the oldest
+        // table it replaced sat, which its filename id does not reflect - so this manifest write is
+        // the only record of the true age order.
+        writeManifest();
+
+        // Delete only after the replacement is durable and named by the manifest, so a crash
+        // mid-compaction leaves a consistent set either way.
         for (var table : toMerge) {
             table.close();
             Files.deleteIfExists(table.path());

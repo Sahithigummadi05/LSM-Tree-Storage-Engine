@@ -87,6 +87,36 @@ from inside a process. Verifying that needs real hardware losing power or a faul
 filesystem. This is stated plainly here rather than left for a reader to assume the test covers
 more than it can.
 
+## The bug that only appeared after a restart
+
+Table order is correctness, not bookkeeping: reads walk newest-to-oldest and take the first hit, so
+if the order is wrong an older value shadows a newer one.
+
+In memory that order was right — compaction splices the merged table into the slot of the
+**oldest** table it replaced. On disk it was wrong: the merged table gets a fresh (highest) id,
+while recovery sorted tables by id. So any compaction that merged something other than the newest
+tables produced a persisted order **reversed** relative to reality.
+
+What made it dangerous is how well it hid. Every in-process check passed:
+
+```
+before compaction : x = NEW
+after  compaction : x = NEW      <- still correct
+after  REOPEN     : x = OLD      <- stale value resurrected, no error
+```
+
+No exception, no corruption warning — just a previous value, returned confidently. The same shape
+silently undoes deletions: a tombstone reordered behind its own value brings the deleted key back.
+Nothing short of closing and reopening the store could reveal it, and no test that kept one store
+open ever would.
+
+The fix is a **manifest** recording the true order, committed atomically (temp file, fsync, rename)
+after every flush and compaction — the mechanism LevelDB and RocksDB use, for exactly this reason.
+Ordering the writes makes crashes safe in both directions: a new table is durable before the
+manifest names it, and old tables are deleted only after the manifest stops naming it. Any `.db`
+file the manifest doesn't list is crash debris and is discarded, its records still recoverable from
+the log.
+
 ## Range scans
 
 ```java
@@ -205,7 +235,7 @@ machine.
 | `memtable/Memtable` | Sorted in-memory buffer (`ConcurrentSkipListMap`, unsigned key order) |
 | `sstable/SSTable` | Immutable sorted file: data, sparse index, bloom filter, footer with magic |
 | `bloom/BloomFilter` | Double-hashed bit array sized from expected entries and target FP rate |
-| `LsmStore` | Read path, flush, compaction (full and size-tiered), crash recovery |
+| `LsmStore` | Read path, flush, compaction (full and size-tiered), manifest, crash recovery |
 | `MergingScanner` | Heap-based k-way merge for range scans, newest-version-wins |
 
 **A few decisions worth calling out:**
@@ -227,7 +257,7 @@ machine.
 ## Testing
 
 ```bash
-mvn test     # 52 tests
+mvn test     # 57 tests
 ```
 
 Beyond the crash and bloom suites, `LsmStoreTest` includes **differential testing against a
